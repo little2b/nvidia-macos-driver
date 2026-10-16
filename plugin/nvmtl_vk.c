@@ -5894,6 +5894,51 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
     memcpy(dst, src, n);
 }
 
+#if defined(__x86_64__)
+__attribute__((target("sse4.1")))
+static void nvmtl_copy_surface_rows_stream(void *dst, const void *src, size_t tight,
+                                          size_t row_bytes, uint32_t rows)
+{
+    // IOSurface remains locked and the staging buffer is not submitted until
+    // all rows are copied. Fence the whole load sequence, not each padded row.
+    _mm_mfence();
+    for (uint32_t y = 0; y < rows; y++) {
+        const __m128i *s = (const __m128i *)((const uint8_t *)src + (size_t)y * row_bytes);
+        char *d = (char *)dst + (size_t)y * tight;
+        const size_t blocks = tight / 64;
+        for (size_t i = 0; i < blocks; i++, s += 4, d += 64) {
+            const __m128i a = _mm_stream_load_si128((__m128i *)s);
+            const __m128i b = _mm_stream_load_si128((__m128i *)s + 1);
+            const __m128i c = _mm_stream_load_si128((__m128i *)s + 2);
+            const __m128i e = _mm_stream_load_si128((__m128i *)s + 3);
+            _mm_storeu_si128((__m128i *)d, a);
+            _mm_storeu_si128((__m128i *)(d + 16), b);
+            _mm_storeu_si128((__m128i *)(d + 32), c);
+            _mm_storeu_si128((__m128i *)(d + 48), e);
+        }
+        memcpy(d, s, tight - blocks * 64);
+    }
+    _mm_mfence();
+}
+#endif
+static void nvmtl_copy_surface_rows(void *dst, const void *src, size_t tight,
+                                    size_t row_bytes, uint32_t rows)
+{
+    if (row_bytes == tight) {
+        nvmtl_copy_from_surface(dst, src, tight * (size_t)rows);
+        return;
+    }
+#if defined(__x86_64__)
+    if (tight >= 4096 && !(((uintptr_t)src | row_bytes) & 15) && __builtin_cpu_supports("sse4.1")) {
+        nvmtl_copy_surface_rows_stream(dst, src, tight, row_bytes, rows);
+        return;
+    }
+#endif
+    for (uint32_t y = 0; y < rows; y++)
+        nvmtl_copy_from_surface((uint8_t *)dst + (size_t)y * tight,
+                               (const uint8_t *)src + (size_t)y * row_bytes, tight);
+}
+
 int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
@@ -5904,8 +5949,7 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
     if (!sl) return -1;
     uint8_t *dst = (uint8_t *)sl->buf.map;
     if (row_bytes == tight) nvmtl_copy_from_surface(dst, src, tight * (size_t)rows);   /* a 4K surface is 2160 rows of 15 KB: one pass, not 2160 calls */
-    else for (uint32_t y = 0; y < rows; y++)
-        nvmtl_copy_from_surface(dst + (size_t)y * tight, (const uint8_t *)src + (size_t)y * row_bytes, tight);
+    else nvmtl_copy_surface_rows(dst, src, tight, row_bytes, rows);
     nvk_cmdbuf *const c = &sl->cb;
     if (nvmtl_vk_cmd_begin(q, c)) return -1;
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };

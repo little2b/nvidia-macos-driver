@@ -13,9 +13,12 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("plugin", type=Path)
 parser.add_argument("output", type=Path)
 parser.add_argument("--rounds", type=int, default=3)
+parser.add_argument("--width", type=int, default=3840)
 args = parser.parse_args()
 if not 1 <= args.rounds <= 20:
     parser.error("rounds must be 1..20")
+if not 1024 <= args.width <= 4096:
+    parser.error("width must be 1024..4096")
 plugin = args.plugin.resolve(strict=True)
 args.output.mkdir(parents=True, exist_ok=False)
 env = {k:v for k,v in os.environ.items() if not k.startswith(("DYLD_", "NM_TEST_", "GPU_PROBE_"))}
@@ -32,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix="nvmtl-churn-") as temporary:
         if windowserver() != initial:
             raise RuntimeError("WindowServer restarted")
         try:
-            p = subprocess.run([binary,str(plugin),str(mb),str(surfaces)],capture_output=True,
+            p = subprocess.run([binary,str(plugin),str(mb),str(surfaces),str(args.width)],capture_output=True,
                                text=True,env=env,timeout=55)
         except subprocess.TimeoutExpired as error:
             (args.output/(name+".timeout.txt")).write_text(str(error))
@@ -44,6 +47,7 @@ with tempfile.TemporaryDirectory(prefix="nvmtl-churn-") as temporary:
         r = json.loads(p.stdout)
         assert r["verified"] and r["verified_frames"] == 96
         assert r["plugin"] == str(plugin) and r["cache_MiB"] == mb and r["surfaces"] == surfaces
+        assert r["width"] == args.width
         print(name+": verified",flush=True)
         return r
     for i in range(args.rounds):
@@ -58,6 +62,6 @@ for mb in (0,128):
                    "median_frame_ms":statistics.median(statistics.median(r["frame_ms"]) for r in rows),
                    "buffer_allocations":[r["buffer_allocations"] for r in rows]}
 result = {"scope":"Offscreen CPU-update/render/readback workload, not desktop FPS", "summary":summary,
-          "plugin":str(plugin),"sha256":hashlib.sha256(plugin.read_bytes()).hexdigest(),"rounds":args.rounds}
+          "plugin":str(plugin),"sha256":hashlib.sha256(plugin.read_bytes()).hexdigest(),"rounds":args.rounds,"width":args.width}
 (args.output/"summary.json").write_text(json.dumps(result,indent=2)+"\n")
 print(json.dumps(summary,indent=2))

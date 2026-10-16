@@ -4864,7 +4864,12 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
     [self commit];
     // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit)
-    if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    if (ws && !nvmtl_ws_buffer_kernel_waits(self)) [self waitUntilCompleted];
+    else {
+        [self waitUntilScheduled];
+        // Scheduling callbacks may take time. Recheck a visible mode fallback before entering the display pipe.
+        if (ws && !nvmtl_ws_buffer_kernel_waits(self)) [self waitUntilCompleted];
+    }
     return self.status != MTLCommandBufferStatusError;
 }
 - (void)commit {

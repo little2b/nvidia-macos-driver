@@ -15,6 +15,7 @@ fixture=r'''
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/sysctl.h>
 // not WindowServer here: the kernel frame marks are never taken
 static int nvmtl_vk_surface_gpu_mark(uint32_t sid,int pending){(void)sid;(void)pending;return -1;}
 static void nvlog(const char *f,...){(void)f;}

@@ -19,7 +19,7 @@ static void readPixel(id<MTLCommandQueue>q,id<MTLTexture>t,id<MTLBuffer>out,unsi
     if(c.status!=MTLCommandBufferStatusCompleted || memcmp(out.contents,want,4))fail("stale/mismatched pixels");
 }
 int main(int argc,char**argv) {@autoreleasepool {
-    if(argc!=4)fail("usage: probe plugin cache-MiB surface-count");
+    if(argc!=4 && argc!=5)fail("usage: probe plugin cache-MiB surface-count [width]");
     int mb=atoi(argv[2]),ns=atoi(argv[3]);if(mb<0||mb>256||ns<1||ns>8)fail("invalid limits");
     void*plugin=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!plugin)fail(dlerror());
     setenv("NVMTL_SURFACE_CACHE_MB",argv[2],1); // after release constructor, before device
@@ -27,7 +27,9 @@ int main(int argc,char**argv) {@autoreleasepool {
     io_service_t svc=IOServiceGetMatchingService(kIOMainPortDefault,IOServiceMatching("NVAccel"));if(!svc)fail("no accelerator");
     id<MTLDevice>d=((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc],NSSelectorFromString(@"initWithAcceleratorPort:"),svc);
     IOObjectRelease(svc);if(!d||strcmp(class_getImageName(object_getClass(d)),argv[1]))fail("wrong plugin");
-    const unsigned w=3840,h=2160;
+    const unsigned w=argc==5 ? (unsigned)atoi(argv[4]) : 3840;
+    if(w<1024 || w>4096)fail("width must be 1024..4096");
+    const unsigned h=w>=3000?2160:1080;
     IOSurfaceRef surfaces[8]={0};
     for(int i=0;i<ns;i++) {
         surfaces[i]=IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth:@(w),(id)kIOSurfaceHeight:@(h),
@@ -50,6 +52,7 @@ int main(int argc,char**argv) {@autoreleasepool {
         double created=now();if(!t)fail("texture allocation");
         unsigned char expected[4]={value,value,value,value};
         readPixel(q,t,pixel,(f*31)%w,(f*17)%h,expected);
+        readPixel(q,t,pixel,w-1,h-1,expected);
         id<MTLCommandBuffer>c=[q commandBuffer];MTLRenderPassDescriptor*rp=[MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture=t;rp.colorAttachments[0].loadAction=MTLLoadActionClear;
         rp.colorAttachments[0].storeAction=MTLStoreActionStore;rp.colorAttachments[0].clearColor=MTLClearColorMake(1,0,0,1);
@@ -59,7 +62,7 @@ int main(int argc,char**argv) {@autoreleasepool {
         if(f>=16){[create addObject:@(created-begin)];[frames addObject:@(now()-begin)];}
     }}
     counts(&after,&bg,&im,&ig,&bytes);
-    NSDictionary*r=@{@"plugin":@(argv[1]),@"cache_MiB":@(mb),@"surfaces":@(ns),@"verified_frames":@96,
+    NSDictionary*r=@{@"plugin":@(argv[1]),@"cache_MiB":@(mb),@"surfaces":@(ns),@"width":@(w),@"height":@(h),@"verified_frames":@96,
         @"create_ms":create,@"frame_ms":frames,@"buffer_allocations":@(after-before),@"verified":@YES};
     NSData*j=[NSJSONSerialization dataWithJSONObject:r options:0 error:nil];fwrite(j.bytes,1,j.length,stdout);fputc('\n',stdout);
     for(int i=0;i<ns;i++)CFRelease(surfaces[i]);

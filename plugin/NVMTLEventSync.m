@@ -80,12 +80,21 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
 // WindowServer's thread (NVIDIA completes flips on the display's flip event, never in the compositor). The marks go
 // through NVK's surface escape because WindowServer's sandbox denies sysctl writes. A mark the kernel does not take (an
 // older NVAccel, debug.nvaccel_surface_gpu_on=0) keeps WindowServer's own wait; that answer is re-read every second.
+// Copy and synchronous-flip transactions can hold display-pipe locks while waiting. Finish publication on the
+// compositor first in those modes, including the boot interval before zero-copy flips are enabled.
 static _Atomic int nvmtl_ws_marks_on = -1;
 static _Atomic uint64_t nvmtl_ws_marks_checked;
 static BOOL nvmtl_ws_kernel_waits(void) {
     static int ws = -1;
     if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer") && !getenv("NVMTL_WS_WAIT_COMPLETION");
     if (!ws) return NO;
+    int flip = 0, async = 0;
+    size_t size = sizeof flip;
+    if (sysctlbyname("debug.nvaccel_iop_flip", &flip, &size, NULL, 0) || size != sizeof flip || !flip) return NO;
+    size = sizeof async;
+    if (sysctlbyname("debug.nvaccel_iop_async", &async, &size, NULL, 0) || size != sizeof async || !async) return NO;
+    // Do not cache these mode checks: a runtime fallback to synchronous display must take effect immediately.
+    // The more expensive NVK/kernel capability probe below retains its one-second cache.
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (atomic_load(&nvmtl_ws_marks_on) < 0 || now - atomic_load(&nvmtl_ws_marks_checked) > 1000000000ull) {
         const int on = nvmtl_vk_surface_gpu_mark(0, 0) == 0;   // surface 0: a probe the kernel answers and ignores
@@ -96,7 +105,8 @@ static BOOL nvmtl_ws_kernel_waits(void) {
     return atomic_load(&nvmtl_ws_marks_on) == 1;
 }
 static const void *const nvmtl_ws_marks_key = &nvmtl_ws_marks_key;
-static void nvmtl_ws_mark(uint32_t sid, BOOL pending) { (void)nvmtl_vk_surface_gpu_mark(sid, pending); }
+static const void *const nvmtl_ws_waits_key = &nvmtl_ws_waits_key;
+static BOOL nvmtl_ws_mark(uint32_t sid, BOOL pending) { return nvmtl_vk_surface_gpu_mark(sid, pending) == 0; }
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!nvmtl_ws_kernel_waits()) return;
     NSMutableSet *ids = nil;
@@ -108,14 +118,23 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
         }
     }
     if (!ids) return;
-    for (NSNumber *n in ids) nvmtl_ws_mark(n.unsignedIntValue, YES);
-    objc_setAssociatedObject(cb, nvmtl_ws_marks_key, ids, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSMutableSet *accepted = [NSMutableSet new];
+    for (NSNumber *n in ids) if (nvmtl_ws_mark(n.unsignedIntValue, YES)) [accepted addObject:n];
+    // A partially accepted batch still needs ready marks, but cannot let the compositor skip its own completion wait.
+    if (accepted.count) objc_setAssociatedObject(cb, nvmtl_ws_marks_key, accepted, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (accepted.count && accepted.count == ids.count)
+        objc_setAssociatedObject(cb, nvmtl_ws_waits_key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static BOOL nvmtl_ws_buffer_kernel_waits(NVMTLCommandBuffer *cb) {
+    // Policy may change between commit and wait. Never take the fast path for a buffer that did not mark its surfaces.
+    return [objc_getAssociatedObject(cb, nvmtl_ws_waits_key) boolValue] && nvmtl_ws_kernel_waits();
 }
 static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
     NSSet *ids = objc_getAssociatedObject(cb, nvmtl_ws_marks_key);
     if (!ids) return;
     for (NSNumber *n in ids) nvmtl_ws_mark(n.unsignedIntValue, NO);
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cb, nvmtl_ws_waits_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
