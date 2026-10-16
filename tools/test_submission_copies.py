@@ -7,9 +7,7 @@ import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
 events = (root / 'plugin/NVMTLEventSync.m').read_text()
-start = events.index('static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(')
-prepare_start = events.index('static void nvmtl_prepare_submission_copies(', start)
-helper = events[start:prepare_start]
+prepare_start = events.index('static void nvmtl_prepare_submission_copies(')
 prepare = events[prepare_start:events.index('- (BOOL)nvmtlSubmitAhead', prepare_start)]
 ahead = events[events.index('- (BOOL)nvmtlSubmitAhead'):events.index('static void nvmtl_gsub_ahead_pass1(void);')]
 advance = events[events.index('- (BOOL)nvmtlAdvancePart'):events.index('- (void)nvmtlSubmitWithEvents')]
@@ -31,6 +29,16 @@ typedef struct { void *map; size_t size; } Buffer;
     NVMTLBuffer *_backBuf; NVMTLTexture *_parent; MTLTextureUsage _usage;
 } @end
 @implementation NVMTLTexture @end
+typedef struct { void *cb; } Commands;
+typedef struct { int unused; } nvmtl_inflight;
+@interface NVMTLSubmissionPart : NSObject { @public
+    Commands commands; NSSet *resources; NSArray *surfaces, *scratch, *signals;
+    id waitEvent, signalEvent; uint64_t value;
+    BOOL waitFolded, aheadEmpty; int aheadFailed; unsigned encoders;
+    nvmtl_inflight *inflight;
+    NSArray<NVMTLBuffer *> *copyInputs, *copyOutputs; BOOL copyInputsPrepared, hasHostCopies;
+} @end
+@implementation NVMTLSubmissionPart @end
 static unsigned uploads, downloads, managedCopies;
 enum { NVP_SYNCIN, NVP_SYNCOUT };
 static uint64_t nvmtl_perf_now(void) { return 0; }
@@ -44,6 +52,13 @@ static int nvmtl_vk_copy_buffer(void *q, Buffer *from, size_t off,
 }
 #define nvlog(...) ((void)0)
 '''
+helper = r"""
+static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL writtenOnly) {
+    NVMTLSubmissionPart *part=[NVMTLSubmissionPart new]; part->resources=resources;
+    nvmtl_prepare_submission_copies(part);
+    return writtenOnly ? part->copyOutputs : part->copyInputs;
+}
+"""
 checks = r'''
 int main(void) { @autoreleasepool {
     unsigned char cpu[16]={0}, gpu[16]={0}, shadow[16]={0};
@@ -85,16 +100,6 @@ submission_fixture = r"""
 #import <objc/message.h>
 #include <stdatomic.h>
 #include <time.h>
-typedef struct { void *cb; } Commands;
-typedef struct { int unused; } nvmtl_inflight;
-@interface NVMTLSubmissionPart : NSObject { @public
-    Commands commands; NSSet *resources; NSArray *surfaces, *scratch, *signals;
-    id waitEvent, signalEvent; uint64_t value;
-    BOOL waitFolded, aheadEmpty; int aheadFailed; unsigned encoders;
-    nvmtl_inflight *inflight;
-    NSArray<NVMTLBuffer *> *copyInputs; BOOL copyInputsPrepared, hasHostCopies;
-} @end
-@implementation NVMTLSubmissionPart @end
 @interface NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut;
 @end
@@ -196,12 +201,12 @@ int main(void) { @autoreleasepool {
 """
 with tempfile.TemporaryDirectory() as directory:
     path = pathlib.Path(directory)
-    (path / 'test.m').write_text(fixture + helper + sync + checks)
+    (path / 'test.m').write_text(fixture + prepare + helper + sync + checks)
     subprocess.run(['clang', '-fobjc-arc', '-framework', 'Foundation',
                     '-framework', 'Metal', str(path / 'test.m'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)
 
-    (path / 'submission.m').write_text(fixture + helper + sync + submission_fixture + prepare + ahead + advance + submission_checks)
+    (path / 'submission.m').write_text(fixture + prepare + sync + submission_fixture + ahead + advance + submission_checks)
     subprocess.run(['clang', '-fobjc-arc', '-framework', 'Foundation',
                     '-framework', 'Metal', str(path / 'submission.m'), '-o', str(path / 'submission')], check=True)
     env = dict(os.environ)

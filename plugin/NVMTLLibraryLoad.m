@@ -1139,6 +1139,55 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
     return d;
 }
 
+// Only requests for the same cache key wait on each other. Keep completed data on
+// the flight until its waiters return, even if NSCache evicts it in the meantime.
+@interface NVMTLShaderFlight : NSObject
+@property(nonatomic, strong) dispatch_group_t group;
+@property(nonatomic, strong) NSData *result;
+@property(nonatomic, copy) NSString *error;
+@end
+@implementation NVMTLShaderFlight
+@end
+
+static NSData *nvmtl_shader_singleflight(NSString *key, NSString **error,
+                                        NSData *(^build)(NSString **)) {
+    if (!key) return build(error);
+    static NSMutableDictionary<NSString *, NVMTLShaderFlight *> *flights;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ flights = [NSMutableDictionary new]; });
+    NVMTLShaderFlight *flight;
+    BOOL owner = NO;
+    @synchronized(flights) {
+        flight = flights[key];
+        if (!flight) {
+            flight = [NVMTLShaderFlight new];
+            flight.group = dispatch_group_create();
+            dispatch_group_enter(flight.group);
+            flights[key] = flight;
+            owner = YES;
+        }
+    }
+    if (owner) {
+        @try {
+            NSString *failure = nil;
+            flight.result = build(&failure);
+            flight.error = failure;
+        } @finally {
+            // A failed translation must be retryable; an exception must not
+            // leave concurrent callers waiting forever.
+            if (!flight.result && !flight.error) flight.error = @"shader translation did not complete";
+            @synchronized(flights) {
+                [flights removeObjectForKey:key];
+                dispatch_group_leave(flight.group);
+            }
+        }
+    } else {
+        dispatch_group_wait(flight.group, DISPATCH_TIME_FOREVER);
+    }
+    if (error) *error = flight.error;
+    return flight.result;
+}
+
 NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *name, NSDictionary *constants,
                                        const uint32_t *idx, const uint32_t *sizes,
                                        const uint8_t *const *payloads, size_t n, NSString **err)
@@ -1154,6 +1203,10 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     const BOOL fcCacheOn = path && !getenv("NVMTL_FCCACHE_OFF");   // no folder, no key: NSCache throws on a nil key
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
     if (hit) { gFcHit++; utimes(path.fileSystemRepresentation, NULL); return hit; }   // keep the trimmer's age order
+    return nvmtl_shader_singleflight(fcCacheOn ? path : nil, err, ^NSData *(NSString **buildError) {
+    // Another caller may have populated the cache after our initial lookup.
+    NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
+    if (hit) { gFcHit++; utimes(path.fileSystemRepresentation, NULL); return hit; }
     if (fcCacheOn) hit = [NSData dataWithContentsOfFile:path];
     uint32_t magic = 0;
     if (hit.length >= 20 && hit.length % 4 == 0) {
@@ -1168,7 +1221,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
         }
     }
     gFcMiss++;
-    NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
+    NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, buildError);
     if (result) {
         if (path && [result writeToFile:path atomically:YES]) gFcStored++;
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:path cost:result.length];
@@ -1177,6 +1230,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
               gFcHit, gFcMiss, gFcStored);
     }
     return result;
+    });
 }
 
 static int nvmtl_reflect_air(NVMTLFunction *function, NSString *ll, NSString *stage,

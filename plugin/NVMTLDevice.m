@@ -416,6 +416,34 @@ static bool nvmtl_process_is_allowed(void)
     return ok;
 }
 
+#include "nvmtl_surface_keepalive.h"
+static char nvmtl_surface_keepalive_key;
+static void nvmtl_keep_surface_backing(id device, NVMTLTexture *root, NSArray *key) {
+    if (!key || !root->_vramOn || !root->_surf) return;
+    static NSUInteger budget; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *program = getprogname(), *e = getenv("NVMTL_SURFACE_CACHE_MB");
+        long mb = program && !strcmp(program, "WindowServer") ? 128 : 0;
+        if (e && *e) {
+            char *end = NULL; long value = strtol(e, &end, 10);
+            if (end && !*end && value >= 0 && value <= 256) mb = value;
+        }
+        budget = (NSUInteger)mb << 20;
+    });
+    if (!budget) return;
+    const size_t allocation = IOSurfaceGetAllocSize(root->_surf);
+    if (!allocation || allocation > budget) return;
+    // Charge the surface allocation rounded to the driver's 64 KiB granularity.
+    const NSUInteger cost = (allocation + 65535u) & ~(NSUInteger)65535u;
+    if (cost > budget) return;
+    NVMTLSurfaceKeepalive *recent = objc_getAssociatedObject(device, &nvmtl_surface_keepalive_key);
+    if (!recent) {
+        recent = [[NVMTLSurfaceKeepalive alloc] initWithLimit:budget];
+        objc_setAssociatedObject(device, &nvmtl_surface_keepalive_key, recent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [recent keep:root key:key cost:cost];
+}
+
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -855,15 +883,16 @@ static char nvmtl_surface_cache_key;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
-    // Failed BAR imports use a private image. Repeated wrappers of the same
-    // surface must share that image, just as successful family imports do,
-    // whether a wrapper reads it or writes it (the image is made writable).
-    // Weak entries do not pin the image after the application's last wrapper.
-    if (backing && !backing->_vramOn) {
+    // Keep one import while wrappers of the same surface remain alive. Aliases
+    // retain the root, so its imported memory outlives their GPU work; the weak
+    // cache does not pin it after the last wrapper. A read-only VRAM import may
+    // lack storage-image usage, so a later ShaderWrite request needs a new one.
+    if (backing && (!backing->_vramOn || !wantStex || backing->_stex)) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
             nvmtl_texture_desc_swizzle(alias, d);
+            nvmtl_keep_surface_backing(self, backing, key);
             return alias;
         }
     }
@@ -876,7 +905,8 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (key) [cache setObject:t forKey:key];
+    nvmtl_keep_surface_backing(self, t, key);
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

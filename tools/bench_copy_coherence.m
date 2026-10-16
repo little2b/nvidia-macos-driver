@@ -5,9 +5,11 @@
 #import <objc/runtime.h>
 #include <dlfcn.h>
 #include <string.h>
+#include "nvmtl_probe_config.h"
 int main(int argc,char **argv) { @autoreleasepool {
  if(argc!=2)return 2;
  if(!dlopen(argv[1],RTLD_NOW|RTLD_LOCAL)){fprintf(stderr,"LOAD: %s\n",dlerror());return 3;}
+ nvmtl_probe_config();
  io_service_t svc=IOServiceGetMatchingService(kIOMainPortDefault,IOServiceMatching("NVAccel")); if(!svc)return 4;
  id<MTLDevice>d=((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc],NSSelectorFromString(@"initWithAcceleratorPort:"),svc);IOObjectRelease(svc);if(!d)return 5;
  printf("DEVICE %s\n",d.name.UTF8String);fflush(stdout);
