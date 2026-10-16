@@ -348,6 +348,34 @@ static bool nvmtl_process_is_allowed(void)
     return ok;
 }
 
+#include "nvmtl_surface_keepalive.h"
+static char nvmtl_surface_keepalive_key;
+static void nvmtl_keep_surface_backing(id device, NVMTLTexture *root, NSArray *key) {
+    if (!key || !root->_vramOn || !root->_surf) return;
+    static NSUInteger budget; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *program = getprogname(), *e = getenv("NVMTL_SURFACE_CACHE_MB");
+        long mb = program && !strcmp(program, "WindowServer") ? 128 : 0;
+        if (e && *e) {
+            char *end = NULL; long value = strtol(e, &end, 10);
+            if (end && !*end && value >= 0 && value <= 256) mb = value;
+        }
+        budget = (NSUInteger)mb << 20;
+    });
+    if (!budget) return;
+    const size_t allocation = IOSurfaceGetAllocSize(root->_surf);
+    if (!allocation || allocation > budget) return;
+    // Charge the surface allocation rounded to the driver's 64 KiB granularity.
+    const NSUInteger cost = (allocation + 65535u) & ~(NSUInteger)65535u;
+    if (cost > budget) return;
+    NVMTLSurfaceKeepalive *recent = objc_getAssociatedObject(device, &nvmtl_surface_keepalive_key);
+    if (!recent) {
+        recent = [[NVMTLSurfaceKeepalive alloc] initWithLimit:budget];
+        objc_setAssociatedObject(device, &nvmtl_surface_keepalive_key, recent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [recent keep:root key:key cost:cost];
+}
+
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -796,6 +824,7 @@ static char nvmtl_surface_cache_key;
         if (alias) {
             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
             nvmtl_texture_desc_swizzle(alias, d);
+            nvmtl_keep_surface_backing(self, backing, key);
             return alias;
         }
     }
@@ -809,6 +838,7 @@ static char nvmtl_surface_cache_key;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
     if (key) [cache setObject:t forKey:key];
+    nvmtl_keep_surface_backing(self, t, key);
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

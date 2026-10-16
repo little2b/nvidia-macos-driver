@@ -5,11 +5,13 @@
 #include <dlfcn.h>
 #import <IOKit/IOKitLib.h>
 #import <objc/message.h>
+#include "nvmtl_probe_config.h"
 int main(int argc,char **argv){@autoreleasepool{
  const char *mode=argc>1?argv[1]:"queued";
  id<MTLDevice>d=nil;
  const char *plugin=getenv("NM_TEST_PLUGIN");
  if(plugin){if(!dlopen(plugin,RTLD_NOW|RTLD_LOCAL)){fprintf(stderr,"%s\n",dlerror());return 3;}
+  nvmtl_probe_config();
   io_service_t svc=IOServiceGetMatchingService(kIOMainPortDefault,IOServiceMatching("NVAccel"));
   if(!svc)return 4;
   d=((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc],NSSelectorFromString(@"initWithAcceleratorPort:"),svc);

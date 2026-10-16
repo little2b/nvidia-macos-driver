@@ -12,6 +12,7 @@
 #import <IOKit/IOKitLib.h>
 #import <objc/message.h>
 #include <dlfcn.h>
+#include "nvmtl_probe_config.h"
 
 static const char *kSrc = "#include <metal_stdlib>\nusing namespace metal;\n"
     "kernel void wr(texture2d<float, access::write> t [[texture(0)]], uint2 p [[thread_position_in_grid]]) {\n"
@@ -29,6 +30,7 @@ int main(void)
         const char *plugin = getenv("NM_TEST_PLUGIN");
         if (plugin) {
             if (!dlopen(plugin, RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr, "%s\n", dlerror()); return 3; }
+            nvmtl_probe_config();
             io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
             if (!svc) return 4;
             dev = ((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc], NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
