@@ -11,9 +11,9 @@ import subprocess
 import tempfile
 
 
-def summarize(runs):
+def summarize(runs, modes=("compute", "image")):
     result = {}
-    for mode in ("compute", "image"):
+    for mode in modes:
         groups = {}
         for policy in ("poll", "event"):
             selected = [r for r in runs if r["mode"] == mode and r["policy"] == policy]
@@ -42,11 +42,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path, help="new directory for samples and local logs")
     parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--plugin", type=Path, help="isolated plugin binary; does not install it")
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("--rounds must be positive")
     args.output.mkdir(parents=True, exist_ok=False)
     environment = dict(os.environ)
+    environment.pop("NM_TEST_PLUGIN", None)
+    if args.plugin is not None:
+        environment["NM_TEST_PLUGIN"] = str(args.plugin.resolve(strict=True))
     for key in list(environment):
         if key.startswith(("DYLD_", "GPU_PROBE_")):
             environment.pop(key)
@@ -60,7 +64,8 @@ def main():
             "xcrun", "clang", "-O2", "-fobjc-arc",
             str(Path(__file__).with_suffix(".m")),
             "-framework", "Foundation", "-framework", "Metal",
-            "-framework", "CoreGraphics", "-framework", "CoreImage", "-o", binary,
+            "-framework", "CoreGraphics", "-framework", "CoreImage",
+            "-framework", "IOKit", "-o", binary,
         ], check=True, env=environment)
 
         def probe(label, mode, policy=None):
@@ -99,9 +104,12 @@ def main():
             return data
 
         probe("inventory", "inventory")
+        modes = ("compute",) if args.plugin else ("compute", "image")
+        if args.plugin:
+            print("Core Image skipped: it would also load the installed plugin.", flush=True)
         for round_number in range(1, args.rounds + 1):
             policies = ("poll", "event") if round_number % 2 else ("event", "poll")
-            for mode in ("compute", "image"):
+            for mode in modes:
                 for policy in policies:
                     data = probe("{}-{}-{}".format(mode, policy, round_number), mode, policy)
                     data["round"] = round_number
@@ -109,7 +117,8 @@ def main():
         for mode in ("events", "transfer"):
             for policy in ("poll", "event"):
                 probe(mode + "-" + policy, mode, policy)
-        result = {"summary": summarize(runs), "runs": runs}
+        result = {"summary": summarize(runs, modes), "runs": runs,
+                  "skipped": ["image (Core Image loads the installed plugin)"] if args.plugin else []}
         (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result["summary"], indent=2))
 

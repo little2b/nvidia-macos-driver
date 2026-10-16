@@ -3,6 +3,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <sys/resource.h>
@@ -44,7 +46,11 @@ int main(int argc,char **argv){@autoreleasepool{
     NSString *mode=argc>1?@(argv[1]):@"inventory";
     // Load the installed plugin first: release builds clear inherited tuning variables.
     // Overrides below exist only in this disposable probe, before device initialization.
-    void *plugin=dlopen("/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver",RTLD_NOW|RTLD_GLOBAL);
+    const char *requested=getenv("NM_TEST_PLUGIN");
+    if(requested && [mode isEqualToString:@"image"])
+        fail(@"Core Image also loads the installed plugin; use the installed-driver image test instead");
+    const char *pluginPath=requested?:"/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver";
+    void *plugin=dlopen(pluginPath,RTLD_NOW|RTLD_GLOBAL);
     if(!plugin)fail(@(dlerror()));
     NSMutableDictionary *overrides=[NSMutableDictionary dictionary];
     for(int i=2;i<argc;i++){
@@ -53,12 +59,18 @@ int main(int argc,char **argv){@autoreleasepool{
         if(![k isEqualToString:@"NVRM_EVENT_WAIT"] || (strcmp(eq+1,"0") && strcmp(eq+1,"1")))fail(@"expected NVRM_EVENT_WAIT=0 or NVRM_EVENT_WAIT=1");
         setenv(k.UTF8String,eq+1,1);overrides[k]=@(eq+1);
     }
-    double init=now();id<MTLDevice> d=MTLCreateSystemDefaultDevice();
+    double init=now();id<MTLDevice> d=nil;
+    if(requested){
+        io_service_t svc=IOServiceGetMatchingService(kIOMainPortDefault,IOServiceMatching("NVAccel"));
+        if(!svc)fail(@"NVAccel unavailable");
+        d=((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc],NSSelectorFromString(@"initWithAcceleratorPort:"),svc);
+        IOObjectRelease(svc);
+    }else d=MTLCreateSystemDefaultDevice();
     if(!d)fail(@"no Metal device");
     NSMutableDictionary *result=[@{@"device":d.name,@"initialization_ms":@((now()-init)*1000),@"mode":mode,@"overrides":overrides,@"recommended_working_set_bytes":@(d.recommendedMaxWorkingSetSize)} mutableCopy];
     result[@"plugin_image"]=@(class_getImageName(object_getClass(d)));
-    if(![result[@"plugin_image"] isEqualToString:@"/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver"])
-        fail(@"the default Metal device is not the installed NVMTL device");
+    if(![result[@"plugin_image"] isEqualToString:@(pluginPath)])
+        fail(@"the Metal device is not from the requested NVMTL plugin");
     result[@"probe_version"]=@2;
     if([mode isEqual:@"inventory"]){
         CGDirectDisplayID display=CGMainDisplayID();CGDisplayModeRef current=CGDisplayCopyDisplayMode(display);

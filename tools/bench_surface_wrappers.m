@@ -2,13 +2,16 @@
 // tile (a compute pass writes it, a later pass in the same command buffer reads it). The second pass must see the first
 // one's pixels. Widths whose row is not a multiple of 32 bytes (572 x 4 = 2288) cannot share the family VRAM and take the
 // plugin's private-image path; 512 x 4 = 2048 can (control).
-// build: clang -fobjc-arc -O1 -o bench_surface_wrappers tools/bench_surface_wrappers.m -framework Metal -framework Foundation -framework IOSurface
+// build: clang -fobjc-arc -O1 -o bench_surface_wrappers tools/bench_surface_wrappers.m -framework Metal -framework Foundation -framework IOSurface -framework IOKit
 // usage: bench_surface_wrappers      cases: write+read in one command buffer / two command buffers / two queues
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <IOKit/IOKitLib.h>
+#import <objc/message.h>
+#include <dlfcn.h>
 
 static const char *kSrc = "#include <metal_stdlib>\nusing namespace metal;\n"
     "kernel void wr(texture2d<float, access::write> t [[texture(0)]], uint2 p [[thread_position_in_grid]]) {\n"
@@ -22,7 +25,17 @@ int main(void)
 {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IONBF, 0);
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); printf("device %s\n", dev.name.UTF8String);
+        id<MTLDevice> dev = nil;
+        const char *plugin = getenv("NM_TEST_PLUGIN");
+        if (plugin) {
+            if (!dlopen(plugin, RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr, "%s\n", dlerror()); return 3; }
+            io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+            if (!svc) return 4;
+            dev = ((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc], NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
+            IOObjectRelease(svc);
+        } else dev = MTLCreateSystemDefaultDevice();
+        if (!dev) return 5;
+        printf("device %s\n", dev.name.UTF8String);
         NSError *e = nil; id<MTLLibrary> lib = [dev newLibraryWithSource:@(kSrc) options:nil error:&e];
         id<MTLComputePipelineState> pw = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"wr"] error:&e];
         id<MTLComputePipelineState> pr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rd"] error:&e];
@@ -38,6 +51,9 @@ int main(void)
                 dw.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead; dw.storageMode = MTLStorageModeShared;
                 MTLTextureDescriptor *dr = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:H mipmapped:NO];
                 dr.usage = MTLTextureUsageShaderRead; dr.storageMode = MTLStorageModeShared;
+                // A read-only first wrapper must not deprive a later writer of storage-image usage.
+                __attribute__((objc_precise_lifetime)) id<MTLTexture> firstReader = [dev newTextureWithDescriptor:dr iosurface:surf plane:0];
+                if (!firstReader) return 6;
                 id<MTLTexture> tw = [dev newTextureWithDescriptor:dw iosurface:surf plane:0];
                 id<MTLTexture> tr = [dev newTextureWithDescriptor:dr iosurface:surf plane:0];
                 if (!tw || !tr) { printf("%4d x %d  %-34s wrappers failed\n", W, H, modes[mode]); bad++; continue; }

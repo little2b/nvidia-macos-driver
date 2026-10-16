@@ -787,11 +787,11 @@ static char nvmtl_surface_cache_key;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
-    // Failed BAR imports use a private image. Repeated wrappers of the same
-    // surface must share that image, just as successful family imports do,
-    // whether a wrapper reads it or writes it (the image is made writable).
-    // Weak entries do not pin the image after the application's last wrapper.
-    if (backing && !backing->_vramOn) {
+    // Keep one import while wrappers of the same surface remain alive. Aliases
+    // retain the root, so its imported memory outlives their GPU work; the weak
+    // cache does not pin it after the last wrapper. A read-only VRAM import may
+    // lack storage-image usage, so a later ShaderWrite request needs a new one.
+    if (backing && (!backing->_vramOn || !wantStex || backing->_stex)) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
@@ -808,7 +808,7 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (key) [cache setObject:t forKey:key];
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

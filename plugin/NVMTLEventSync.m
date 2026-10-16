@@ -19,7 +19,7 @@
     int aheadFailed;
     BOOL waitFolded;
     BOOL aheadEmpty;
-    NSArray<NVMTLBuffer *> *copyInputs;
+    NSArray<NVMTLBuffer *> *copyInputs, *copyOutputs;
     BOOL copyInputsPrepared, hasHostCopies;
 }
 @end
@@ -327,32 +327,33 @@ static void nvmtl_gsub_census(void) {
 }
 // A texture over a copy-backed buffer must refresh the same bytes as a direct
 // buffer binding. Keep direct managed-buffer writeback and copy each backing once.
-static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL writtenOnly) {
-    NSMutableSet<NVMTLBuffer *> *copies = nil;
-    for (id resource in resources) {
+static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
+    if (part->copyInputsPrepared) return;
+    // Resource membership, texture usage and backing modes are fixed after seal.
+    // Classify both directions once; completion must not rescan every GPU-only
+    // resource. The actual byte transfers still happen at submit and completion.
+    NSMutableSet<NVMTLBuffer *> *inputs = nil, *outputs = nil;
+    for (id resource in part->resources) {
         NVMTLBuffer *buffer = nil;
+        BOOL writable = YES;
         if ([resource isKindOfClass:[NVMTLBuffer class]]) buffer = resource;
         else if ([resource isKindOfClass:[NVMTLTexture class]]) {
             NVMTLTexture *texture = resource;
-            if (writtenOnly && texture->_usage != MTLTextureUsageUnknown &&
-                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;
+            writable = texture->_usage == MTLTextureUsageUnknown ||
+                (texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget));
             buffer = texture->_backBuf ?: (texture->_parent ? texture->_parent->_backBuf : nil);
         }
         if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) continue;
-        if (!copies) copies = [NSMutableSet new];
-        [copies addObject:buffer];
+        if (!inputs) inputs = [NSMutableSet new];
+        [inputs addObject:buffer];
+        if (buffer->_hostPtr) part->hasHostCopies = YES;
+        if (writable) {
+            if (!outputs) outputs = [NSMutableSet new];
+            [outputs addObject:buffer];
+        }
     }
-    return copies.allObjects;
-}
-static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
-    if (part->copyInputsPrepared) return;
-    // A sealed part's membership and its buffers' backing modes do not change.
-    // The ahead pass can retry a held part many times: discover its upload
-    // backings once, but refresh their bytes only when it actually submits.
-    part->copyInputs = nvmtl_submission_copies(part->resources, NO);
-    for (NVMTLBuffer *buffer in part->copyInputs) {
-        if (buffer->_hostPtr) { part->hasHostCopies = YES; break; }
-    }
+    part->copyInputs = inputs.allObjects;
+    part->copyOutputs = outputs.allObjects;
     part->copyInputsPrepared = YES;
 }
 - (BOOL)nvmtlSubmitAhead {
@@ -467,7 +468,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         BOOL published = result == 0;
         if (published) {
             for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
-            for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
+            for (NVMTLBuffer *buffer in part->copyOutputs) nvmtl_buffer_sync_out(buffer);
         }
         if (!published) {
             [self nvmtlFinishExecution:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
